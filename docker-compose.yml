@@ -1,0 +1,77 @@
+services:
+
+  # ──────────────────────────────────────────────
+  # ZAP: スパイダー/スキャンエンジン
+  # claude-codeからのAPI呼び出しを受け付ける
+  # 起動時にzap-config/内のcontextファイルを自動ロード
+  # ──────────────────────────────────────────────
+  zap:
+    image: ghcr.io/zaproxy/zaproxy:stable
+    container_name: zap
+    command: >
+      zap.sh -daemon
+      -host 0.0.0.0
+      -port 8080
+      -config api.key=${ZAP_API_KEY}
+      -config api.addrs.addr.name=.*
+      -config api.addrs.addr.regex=true
+      -dir /home/zap/.ZAP
+      -config database.newsession=3
+    volumes:
+      # zap-config/ にscan-context.contextを置いておくと起動時に自動ロード
+      - ./zap-config:/home/zap/.ZAP
+      - ./reports:/zap/reports
+    networks:
+      - internal  # claude-codeとの内部通信
+      - external  # 診断対象への直接通信
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/JSON/core/view/version/?apikey=${ZAP_API_KEY}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ──────────────────────────────────────────────
+  # Claude Code: 診断エージェント
+  # ZAP REST APIを操作しながら能動的に診断を実施
+  # Anthropic APIへの通信はsquid（ホスト）経由
+  # ──────────────────────────────────────────────
+  claude-code:
+    build:
+      context: ./claude-code
+      dockerfile: Dockerfile
+    container_name: claude-code
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ZAP_API_KEY=${ZAP_API_KEY}
+      - ZAP_BASE_URL=http://zap:8080
+      - TARGET_URL=${TARGET_URL}
+      # Anthropic APIはsquid（ホスト）経由
+      - HTTP_PROXY=http://172.17.0.1:3128
+      - HTTPS_PROXY=http://172.17.0.1:3128
+      # ZAPへの内部通信とhost.docker.internalはプロキシを通さない
+      - NO_PROXY=zap,127.0.0.1,localhost,host.docker.internal
+    volumes:
+      - ./reports:/workspace/reports
+    networks:
+      - internal   # ZAPとの内部通信
+      - external   # squid経由でAnthropicへ
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    cap_drop:
+      - ALL
+    depends_on:
+      zap:
+        condition: service_healthy
+
+networks:
+  # claude-code と zap が所属。お互いに通信できる
+  internal:
+    driver: bridge
+    internal: true
+
+  # zap と claude-code が所属。外部への通信が可能
+  external:
+    driver: bridge
