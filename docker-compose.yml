@@ -1,9 +1,29 @@
 services:
 
   # ──────────────────────────────────────────────
+  # Squid: 送信先制限プロキシ
+  # - claude-code / zap 両方の外部通信を中継する
+  # - 許可宛先: Anthropic API + TARGET_URLのドメイン のみ
+  # - entrypointスクリプトで起動時に.envのTARGET_URLを読んでsquid.confを生成する
+  # ──────────────────────────────────────────────
+  squid:
+    image: ubuntu/squid:6.1-23.10_beta
+    container_name: squid
+    environment:
+      - TARGET_URL=${TARGET_URL}
+    entrypoint: ["/bin/sh", "/squid-config/entrypoint.sh"]
+    volumes:
+      - ./squid-config:/squid-config:ro
+    networks:
+      - proxy    # claude-code / zap からのリクエストを受け付ける
+      - external # 外部（Anthropic API / 診断対象）への通信
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ──────────────────────────────────────────────
   # ZAP: スパイダー/スキャンエンジン
-  # claude-codeからのAPI呼び出しを受け付ける
-  # 起動時にzap-config/内のcontextファイルを自動ロード
+  # - 外部通信はすべてSquid経由（HTTP_PROXY設定）
+  # - ZAP自身のAPI（内部通信）はNO_PROXYで除外
   # ──────────────────────────────────────────────
   zap:
     image: ghcr.io/zaproxy/zaproxy:stable
@@ -17,15 +37,22 @@ services:
       -config api.addrs.addr.regex=true
       -dir /home/zap/.ZAP
       -config database.newsession=3
+    environment:
+      # 診断対象へのアクセスもSquid経由
+      - HTTP_PROXY=http://squid:3128
+      - HTTPS_PROXY=http://squid:3128
+      # ZAP自身のAPI・localhost系はプロキシを通さない
+      - NO_PROXY=127.0.0.1,localhost
     volumes:
-      # zap-config/ にscan-context.contextを置いておくと起動時に自動ロード
       - ./zap-config:/home/zap/.ZAP
       - ./reports:/zap/reports
     networks:
-      - internal  # claude-codeとの内部通信
-      - external  # 診断対象への直接通信
+      - internal # claude-codeとの内部通信
+      - proxy    # Squidへの接続
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    depends_on:
+      - squid
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/JSON/core/view/version/?apikey=${ZAP_API_KEY}"]
       interval: 10s
@@ -35,8 +62,9 @@ services:
 
   # ──────────────────────────────────────────────
   # Claude Code: 診断エージェント
-  # ZAP REST APIを操作しながら能動的に診断を実施
-  # Anthropic APIへの通信はsquid（ホスト）経由
+  # - 外部通信はSquid経由（Anthropic APIのみ許可）
+  # - ZAPとの通信はinternal network内で完結
+  # - ZAPのAPI（内部通信）はNO_PROXYで除外
   # ──────────────────────────────────────────────
   claude-code:
     build:
@@ -48,18 +76,17 @@ services:
       - ZAP_API_KEY=${ZAP_API_KEY}
       - ZAP_BASE_URL=http://zap:8080
       - TARGET_URL=${TARGET_URL}
-      # Anthropic APIはsquid（ホスト）経由
-      - HTTP_PROXY=http://172.17.0.1:3128
-      - HTTPS_PROXY=http://172.17.0.1:3128
-      # ZAPへの内部通信とhost.docker.internalはプロキシを通さない
-      - NO_PROXY=zap,127.0.0.1,localhost,host.docker.internal
+      # Anthropic APIはSquid経由
+      - HTTP_PROXY=http://squid:3128
+      - HTTPS_PROXY=http://squid:3128
+      # ZAPへの内部通信・localhost系はプロキシを通さない
+      - NO_PROXY=zap,127.0.0.1,localhost
     volumes:
       - ./reports:/workspace/reports
+    user: "1001:1001"
     networks:
-      - internal   # ZAPとの内部通信
-      - external   # squid経由でAnthropicへ
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - internal # ZAPとの内部通信
+      - proxy    # Squidへの接続
     cap_drop:
       - ALL
     depends_on:
@@ -67,11 +94,16 @@ services:
         condition: service_healthy
 
 networks:
-  # claude-code と zap が所属。お互いに通信できる
+  # claude-code ↔ zap 専用。external: falseで外部通信不可
   internal:
     driver: bridge
     internal: true
 
-  # zap と claude-code が所属。外部への通信が可能
+  # claude-code / zap → squid 専用
+  proxy:
+    driver: bridge
+    internal: true  # Squidコンテナ自体はexternalに所属するので、proxyはinternal:trueで問題ない
+
+  # squid → 外部（Anthropic API / 診断対象）
   external:
     driver: bridge
