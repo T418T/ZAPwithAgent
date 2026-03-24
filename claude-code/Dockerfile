@@ -29,5 +29,5 @@ RUN mkdir -p /workspace/reports
 
 # --dangerously-skip-permissions で無人実行
 # TARGET_URL と診断開始の指示を渡して起動
-ENTRYPOINT ["claude", "--dangerously-skip-permissions", "-p"]
-CMD ["zap-scanスキルを使って$TARGET_URLの脆弱性診断を実施してください"]
+ENTRYPOINT ["/bin/sh", "-c"]
+CMD ["claude --dangerously-skip-permissions -p \"zap-scanスキルを使って${TARGET_URL}の脆弱性診断を実施してください\""]
